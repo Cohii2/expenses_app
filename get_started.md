@@ -1,6 +1,7 @@
 # Getting started
 Our app allows you to keep track of expenses without having to manually update them!
 
+
 To do this we require you to do 2 things:
 1. Setup **email** transaction alerts from your own bank
 2. Setup auto forwarding from your email to your unique forwarding email that we assign you
