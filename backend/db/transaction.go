@@ -48,7 +48,7 @@ func PostTransaction(transaction models.Transaction) (*models.Transaction, error
 
 	createURL := fmt.Sprintf("%s/rest/v1/transactions", supabaseURL)
 	if transaction.UserId == "" || transaction.Merchant == "" || transaction.Amount == 0 ||
-		transaction.Account == "" || transaction.Category == "" || transaction.DateTime.IsZero() {
+		transaction.Account == "" || transaction.Category == "" || transaction.DateTime == nil {
 		return nil, errors.New("one or more fields are empty")
 	}
 
@@ -134,8 +134,6 @@ func DeleteTransaction(transaction models.Transaction) (*models.Transaction, err
 	}
 
 	deleteURL := fmt.Sprintf("%s/rest/v1/transactions?transaction_id=eq.%s", supabaseURL, transaction.TransactionId)
-
-	// payloadBytes, _ := json.Marshal(transaction)
 
 	req2, _ := http.NewRequestWithContext(context.Background(), "DELETE", deleteURL, nil)
 	req2.Header.Set("apikey", supabaseKey)

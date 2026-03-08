@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -40,7 +41,7 @@ func ExtractUnknownBankTransaction(plaintext string) (string, error) {
 	prompt := buildPrompt(plaintext)
 
 	reqBody := ORRequest{
-		Model: "mistralai/devstral-2512:free",
+		Model: "nvidia/nemotron-3-nano-30b-a3b:free",
 		Messages: []ORMessage{
 			{Role: "system", Content: prompt},
 			{Role: "user", Content: plaintext},
@@ -58,12 +59,20 @@ func ExtractUnknownBankTransaction(plaintext string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf(
+			"openrouter error %d: %s",
+			resp.StatusCode,
+			string(body),
+		)
+	}
 	var data OROutput
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return "", err
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", fmt.Errorf("error decoding json: %s", err.Error())
 	}
 
-	if len(data.Choices) == 0 {
+	if len(data.Choices) == 0 && resp.StatusCode > 400 {
 		return "", fmt.Errorf("no response from model")
 	}
 
@@ -85,6 +94,8 @@ func buildPrompt(input string) string {
 var promptTemplate = `
 You are a financial transaction extraction engine.
 You receive plaintext converted from bank emails.
+Some emails may **not be transactions**. In such cases, set "is_transaction": false.
+Otherwise, extract the transaction and set "is_transaction": true.
 Extract ONLY the following fields and return ONLY valid JSON. No markdown.
 
 Required JSON structure:
@@ -95,7 +106,8 @@ Required JSON structure:
   "currency": "SGD|USD|EUR|...",
   "datetime": "ISO8601",
   "category": "",
-  "type": ""
+  "type": "",
+  "is_transaction": true
 }
 
 Context:
@@ -172,7 +184,29 @@ Output:
   "currency": "USD",
   "datetime": "2025-11-05T08:10:00Z",
   "category": "transport",
-  "type": "expense"
+  "type": "expense",
+  "is_transaction": true
+}
+
+Input:
+"The key insights today:
+▪	Why there could be more upside for gold
+▪	Fears of a tech bubble in public US equities may be unfounded
+▪	While governments are trying to overcome the most prominent economic chokepoints, new ones may emerge
+▪	German economic outlook: 1.1 growth this year
+▪	Briefings Brainteaser: copper consumption
+
+Want to sign up and stay connected? Click here."
+Output:
+{
+	"merchant": "",
+	"account": "",
+	"amount": null,
+	"currency": "",
+	"datetime": null,
+	"category": "",
+	"type": "",
+	"is_transaction": false
 }
 
 Input:
@@ -185,8 +219,32 @@ Output:
   "currency": "SGD",
   "datetime": "2026-01-09T21:45:00Z",
   "category": "transfers",
-  "type": "expense"
+  "type": "expense",
+  "is_transaction": true
 }
+
+Input:
+"Top job picks for you: https://www.linkedin.com/comm/jobs/collections/recommended?origin=JYMBII_EMAIL&lgCta=eml-jymbii-bottom-see-all-jobs&lgTemp=jobs_jymbii_digest&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3Bi6uuB3iXRwO%2FmivahHReaA%3D%3D&midToken=AQFFZxkCQcXL_g&midSig=2jkRO8hCOz5I81&trk=eml-jobs_jymbii_digest-null-0-null&trkEmail=eml-jobs_jymbii_digest-null-0-null-null-fla1es~ml1kyxhy~t5-null-null&eid=fla1es-ml1kyxhy-t5&otpToken=MWIwMTFjZTcxMTJjYzBjMmIwMjQwNGVkNDAxN2VmYjU4NmM5ZDM0NjlmYWE4YjYxNzljNTA3Njk0OTVhNWJmYWY0ZGNkZmI2NDBjOGJjZjQ3ZjlhZjk0NTc3ZDE5M2QxZTZkNTE2ODA5NTE0NDllYTQ5YzgyYiwxLDE%3D
+
+
+Strategy Analyst, Governance - TikTok Shop
+TikTok
+Singapore
+
+1 connection
+Apply with resume & profile"
+Output:
+{
+	"merchant": "",
+	"account": "",
+	"amount": null,
+	"currency": "",
+	"datetime": null,
+	"category": "",
+	"type": "",
+	"is_transaction": false
+}
+
 
 Input:
 "Transaction Ref: TF518721765433374243
@@ -205,7 +263,8 @@ Output:
   "currency": "SGD",
   "datetime": "2025-12-11T14:13:00Z",
   "category": "transfers",
-  "type": "expense"
+  "type": "expense",
+  "is_transaction": true
 }
 
 Input:
@@ -223,7 +282,8 @@ Output:
   "currency": "SGD",
   "datetime": "2025-12-01T13:04:00Z",
   "category": "food_and_dining",
-  "type": "expense"
+  "type": "expense",
+  "is_transaction": true
 }
 
 Input:
@@ -240,7 +300,8 @@ Output:
   "currency": "SGD",
   "datetime": "2025-11-30T00:00:00Z",
   "category": "salary",
-  "type": "income"
+  "type": "income",
+  "is_transaction": true
 }
 
 Input:
@@ -256,7 +317,8 @@ Output:
   "currency": "SGD",
   "datetime": "2025-12-15T18:42:00Z",
   "category": "transfers",
-  "type": "income"
+  "type": "income",
+  "is_transaction": true
 }
 
 ---
