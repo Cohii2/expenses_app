@@ -3,16 +3,20 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"expenses/db"
 	"expenses/logx"
 	"expenses/models"
 	"expenses/openrouter"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/jaytaylor/html2text"
@@ -47,6 +51,18 @@ func PostWebhookHandler(ctx context.Context, c *app.RequestContext) {
 	if err := json.Unmarshal(requestBody, &emailMetadata); err != nil {
 		logx.Logger.Error(fmt.Sprintf("failed to decode webhook: %s", err.Error()))
 		c.JSON(400, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if projectName, matched := extractSupabaseProjectName(emailMetadata.Data.Subject); matched {
+		logx.Logger.Info(fmt.Sprintf("detected Supabase pause notification for project %q, attempting to resume", projectName))
+		if err := resumeSupabaseProject(projectName); err != nil {
+			logx.Logger.Error(fmt.Sprintf("failed to resume supabase project: %s", err.Error()))
+			c.JSON(500, map[string]string{"error": err.Error()})
+			return
+		}
+		logx.Logger.Info("supabase project resume triggered successfully")
+		c.JSON(200, map[string]string{"message": "supabase project resume triggered successfully"})
 		return
 	}
 
@@ -203,29 +219,145 @@ func handleNonTransactionEmail(ctx context.Context, emailContent string, user db
 	return nil
 }
 
+var pauseSubjectRegex = regexp.MustCompile(`^Your Supabase Project (.+?) has been paused\.$`)
+
+func extractSupabaseProjectName(subject string) (string, bool) {
+	matches := pauseSubjectRegex.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return "", false
+	}
+	return matches[1], true
+}
+
+func resumeSupabaseProject(projectName string) error {
+	accessToken := os.Getenv("SUPABASE_ACCESS_TOKEN")
+	projectRefsJSON := os.Getenv("SUPABASE_PROJECT_REFS")
+
+	if accessToken == "" || projectRefsJSON == "" {
+		return fmt.Errorf("SUPABASE_ACCESS_TOKEN or SUPABASE_PROJECT_REFS not set")
+	}
+
+	var projectRefs map[string]string
+	if err := json.Unmarshal([]byte(projectRefsJSON), &projectRefs); err != nil {
+		return fmt.Errorf("failed to parse SUPABASE_PROJECT_REFS: %w", err)
+	}
+
+	projectRef, ok := projectRefs[projectName]
+	if !ok {
+		return fmt.Errorf("no project ref configured for project name %q", projectName)
+	}
+
+	restoreURL := fmt.Sprintf("https://api.supabase.com/v1/projects/%s/restore", projectRef)
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST", restoreURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("supabase restore failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// backlogDailyLimit caps how many backlog emails are sent to the model per
+// UTC day (OpenRouter's free quota resets at 00:00 UTC), so the backlog
+// can't eat the allowance live transactions need. The count lives in memory
+// and resets if the server restarts.
+const backlogDailyLimit = 10
+
+var backlogBudget struct {
+	mu   sync.Mutex
+	day  string // UTC date, "2006-01-02"
+	used int
+}
+
+// takeBacklogBudget reserves one backlog slot for today, returning false
+// once the daily limit has been reached.
+func takeBacklogBudget() bool {
+	backlogBudget.mu.Lock()
+	defer backlogBudget.mu.Unlock()
+
+	today := time.Now().UTC().Format("2006-01-02")
+	if backlogBudget.day != today {
+		backlogBudget.day = today
+		backlogBudget.used = 0
+	}
+	if backlogBudget.used >= backlogDailyLimit {
+		return false
+	}
+	backlogBudget.used++
+	return true
+}
+
 func ClearEmailQueue() error {
 	failedEmailList, err := db.GetFailEmailList()
 	if err != nil {
 		return err
 	}
 
+	var processed, cleared, failures int
 	for _, email := range failedEmailList {
+		if !takeBacklogBudget() {
+			logx.Logger.Info(fmt.Sprintf("backlog daily limit (%d) reached; leaving the rest for tomorrow", backlogDailyLimit))
+			break
+		}
+		processed++
+
 		transaction, err := parseEmailBody(email.ReceivedEmail)
 		if err != nil {
-			return err
+			// Locked out by OpenRouter: every remaining email would fail the
+			// same way, so stop and leave them queued.
+			if resetAt, ok := openrouter.IsRateLimited(err); ok {
+				logx.Logger.Info(fmt.Sprintf("backlog paused: OpenRouter rate limited until %s", resetAt.Format(time.RFC3339)))
+				failures++
+				break
+			}
+			logx.Logger.Error(fmt.Sprintf("failed to parse backlog email %v: %s", email.Id, err.Error()))
+			failures++
+			continue
 		}
 
 		transaction.UserId = email.UserID
-		_, err = db.PostTransaction(*transaction)
-		if err != nil {
-			return err
-		}
-		_, err = db.DeleteFailEmail(email.Id)
-		if err != nil {
-			return err
+		duplicate := false
+		if _, err := db.PostTransaction(*transaction); err != nil {
+			if !errors.Is(err, db.ErrDuplicateTransaction) {
+				logx.Logger.Error(fmt.Sprintf("failed to post backlog transaction %v: %s", email.Id, err.Error()))
+				failures++
+				continue
+			}
+			// Already recorded (e.g. by an earlier run): nothing to retry, so
+			// fall through and clear it from the queue.
+			duplicate = true
 		}
 
-		logx.Logger.Info("backlog transaction sucessfully added")
+		if _, err := db.DeleteFailEmail(email.Id); err != nil {
+			logx.Logger.Error(fmt.Sprintf("failed to delete backlog email %v after posting: %s", email.Id, err.Error()))
+			failures++
+			continue
+		}
+		cleared++
+
+		if duplicate {
+			logx.Logger.Info(fmt.Sprintf("backlog transaction already existed, removed from queue: %v", email.Id))
+		} else {
+			logx.Logger.Info(fmt.Sprintf("backlog transaction successfully added: %v", email.Id))
+		}
+	}
+
+	if processed > 0 {
+		logx.Logger.Info(fmt.Sprintf("backlog run: processed %d, cleared %d, failed %d, %d still queued",
+			processed, cleared, failures, len(failedEmailList)-cleared))
 	}
 
 	return nil
